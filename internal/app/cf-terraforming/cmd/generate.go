@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -1089,6 +1090,79 @@ func generateResources() func(cmd *cobra.Command, args []string) {
 
 			jsonStructData[0].(map[string]interface{})["id"] = zoneID
 			jsonStructData[0].(map[string]interface{})["cache_type"] = tieredCache.Type.String()
+		case "cloudflare_teams_list":
+			log.Debug("only requesting the first 1000 Teams Lists due to the service not providing correct pagination responses")
+
+			jsonPayload, _, err := api.ListTeamsLists(context.Background(),
+				cloudflare.AccountIdentifier(accountID),
+				cloudflare.ListTeamListsParams{})
+
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			resourceCount = len(jsonPayload)
+			m, _ := json.Marshal(jsonPayload)
+			err = json.Unmarshal(m, &jsonStructData)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			// Get the contents for each TeamsList
+			for i := 0; i < resourceCount; i++ {
+				structData := jsonStructData[i].(map[string]interface{})
+
+				list_items, _, err := api.ListTeamsListItems(context.Background(),
+					cloudflare.AccountIdentifier(accountID),
+					cloudflare.ListTeamsListItemsParams{ListID: structData["id"].(string)})
+
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				m, _ := json.Marshal(list_items)
+				err = json.Unmarshal(m, &list_items)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				var items []string
+				for _, item := range list_items {
+					items = append(items, item.Value)
+				}
+				jsonStructData[i].(map[string]interface{})["items"] = items
+			}
+		case "cloudflare_teams_rule":
+			log.Debug("only requesting the first 1000 Teams Rules due to the service not providing correct pagination responses")
+
+			jsonPayload, err := api.TeamsRules(context.Background(), accountID)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			resourceCount = len(jsonPayload)
+			m, _ := json.Marshal(jsonPayload)
+			err = json.Unmarshal(m, &jsonStructData)
+			if err != nil {
+				log.Fatal(err)
+			}
+			// List references are stored as $1a365858-af2a-40fd-b625-97e62c318ade but
+			// Terraform config should refer to teams_list resource _name_ and escape the $:
+			// ${var.dollarsign}${cloudflare_teams_list.listname.id}
+			// TODO this does not work when USE_STATIC_RESOURCE_IDS = true
+			// resource "cloudflare_teams_list" "terraform_managed_resource_b0efbb33-1fb8-4ab8-924f-d2eac06d5137" {
+			for i := 0; i < resourceCount; i++ {
+				var traffic_expr = jsonStructData[i].(map[string]interface{})["traffic"].(string)
+
+				var p = ` in \$[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`
+				re := regexp.MustCompile(p)
+				var new_traffic_expr = re.ReplaceAllStringFunc(traffic_expr, func(match string) string {
+					return " in $${var.dollarsign}$${terraform_managed_resource_" + match[6:] + ".id}"
+				})
+
+				jsonStructData[i].(map[string]interface{})["traffic"] = new_traffic_expr
+			}
+
 		default:
 			fmt.Fprintf(cmd.OutOrStdout(), "%q is not yet supported for automatic generation", resourceType)
 			return
@@ -1181,6 +1255,9 @@ func generateResources() func(cmd *cobra.Command, args []string) {
 		}
 
 		tfOutput := string(hclwrite.Format(f.Bytes()))
+		// teams_rule outputs literal $ that should not be escaped
+		// no great solution yet, see https://github.com/hashicorp/hcl/issues/373
+		tfOutput = strings.ReplaceAll(tfOutput, "$$$", "$")
 		fmt.Fprint(cmd.OutOrStdout(), tfOutput)
 	}
 }
